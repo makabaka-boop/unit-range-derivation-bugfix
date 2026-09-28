@@ -74,4 +74,76 @@ test.describe('单位表达式推导', () => {
     await expect(page.getByTestId('error-box')).toContainText('ABSOLUTE_TEMPERATURE_ADD')
     await expect(page.getByTestId('result')).toHaveCount(0)
   })
+
+  test('区间模式：摄氏/华氏温差给出完整上下界与每个节点的区间推导', async ({ page }) => {
+    const input = page.getByTestId('expr-input')
+    const rangeBox = page.getByTestId('range-mode')
+
+    // 输入区间字面量后自动进入区间推导模式。
+    await input.fill('[20,21] °C - [68,86] °F')
+    await expect(rangeBox).toBeChecked()
+
+    const result = page.getByTestId('result')
+    await expect(result).toBeVisible()
+    // 基准区间 [-10,1] dK，目标自动为 dK。
+    await expect(page.locator('[data-testid="result"] .value.range')).toContainText('-10')
+    await expect(page.locator('[data-testid="result"] .value.range')).toContainText('~ 1')
+    await expect(result).toContainText('dK')
+    await expect(result).toContainText('区间结果')
+    await expect(result).toContainText('温差')
+    // 基准值区间提示也必须同时展示两个端点。
+    await expect(result).toContainText('根节点基准值')
+
+    // 每个节点都有下界与上界，不再只显示单个端点。
+    const steps = page.locator('[data-testid="steps"] .step')
+    await expect(steps).toHaveCount(3)
+    for (const li of await steps.all()) {
+      await expect(li).toContainText('基准值区间')
+    }
+
+    // 切到 dF 目标单位：[-18, 9/5] dF。
+    await page.getByTestId('target-select').selectOption('dF')
+    await expect(page.locator('[data-testid="result"] .value.range')).toContainText('-18')
+    await expect(page.locator('[data-testid="result"] .value.range')).toContainText('9/5')
+  })
+
+  test('区间模式：除数区间跨零时报错并定位最小子表达式，且能恢复', async ({ page }) => {
+    const input = page.getByTestId('expr-input')
+    await page.getByTestId('range-mode').check()
+    await input.fill('2 * (1 / [-2,2])')
+
+    const errBox = page.getByTestId('error-box')
+    await expect(errBox).toContainText('DIVISION_BY_ZERO_RANGE')
+    await expect(page.getByTestId('result')).toHaveCount(0)
+    await expect(page.getByTestId('steps')).toHaveCount(0)
+
+    // 最小子表达式 1 / [-2,2] 被高亮。
+    await expect(page.locator('[data-testid="error-highlight"] mark')).toHaveText('1 / [-2,2]')
+
+    // 改回合法区间表达式后结果恢复。
+    await input.fill('[10,20] m - [3,4] m')
+    await expect(page.getByTestId('result')).toBeVisible()
+    await expect(page.locator('[data-testid="result"] .value.range')).toContainText('6')
+    await expect(page.locator('[data-testid="result"] .value.range')).toContainText('17')
+    await expect(page.getByTestId('error-box')).toHaveCount(0)
+  })
+
+  test('区间与标量模式切换仍正常：返回标量表达式后标量结果卡恢复', async ({ page }) => {
+    const input = page.getByTestId('expr-input')
+    const rangeBox = page.getByTestId('range-mode')
+
+    await input.fill('[2,4] * 3')
+    await expect(rangeBox).toBeChecked()
+    await expect(page.locator('[data-testid="result"] .value.range')).toContainText('6 ~ 12')
+
+    // 手动取消区间模式，回到纯标量表达式：标量结果卡（单值）恢复。
+    await rangeBox.uncheck()
+    await input.fill('6 m / 3 s')
+    await expect(page.getByTestId('result')).toBeVisible()
+    await expect(page.locator('[data-testid="result"] .value')).toHaveText('2')
+    await expect(page.locator('[data-testid="result"]')).toContainText('m/s')
+    // 步骤恢复为单值展示。
+    const step = page.locator('[data-testid="steps"] .step').first()
+    await expect(step).toContainText('基准值 =')
+  })
 })

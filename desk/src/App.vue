@@ -73,6 +73,18 @@ const kindText = { normal: '普通量', delta: '温差', absolute: '绝对温度
 
 const runes = computed(() => Array.from(expression.value))
 
+// 区间入口返回的根节点带 lower/upper 字段；标量入口只有 value。
+const isRangeResult = computed(() => {
+  const r = result.value
+  return !!r && r.root && Object.prototype.hasOwnProperty.call(r.root, 'lower')
+})
+
+// 区间上下界的“精确分数 ≈ 小数”展示
+function ratText(v) {
+  if (v.decimal && v.decimal !== v.exact) return `${v.exact} ≈ ${v.decimal}`
+  return v.exact
+}
+
 // 高亮出错的最小区间
 const highlighted = computed(() => {
   const chars = runes.value
@@ -145,9 +157,19 @@ async function evaluate() {
 }
 
 let timer = null
+// 表达式开始写区间字面量（形如 [数字）时自动进入区间推导；之后不再自动
+// 退出，避免编辑中途模式抖动；需要标量求值时由用户手动取消勾选。
 watch([expression, target, rangeMode], () => {
   clearTimeout(timer)
   timer = setTimeout(evaluate, 280)
+})
+
+// 只在表达式实际变化时判断是否需要进入区间模式，避免 watcher 多次触发
+// （目标单位、rangeMode 自身的变化）把用户手动取消勾选的操作覆盖掉。
+watch(expression, val => {
+  if (!rangeMode.value && /\[\s*-?(?:\d|\.)/.test(val)) {
+    rangeMode.value = true
+  }
 })
 
 function useExample(ex) {
@@ -247,9 +269,15 @@ evaluate()
     <!-- 成功结果：errorInfo 非空或尚未计算时整体不渲染，杜绝旧结果残留 -->
     <section v-if="result && !errorInfo" class="panel" data-testid="result">
       <div class="result-card">
-        <span class="value">{{ result.root.value.exact }}</span>
+        <template v-if="isRangeResult">
+          <span class="value range">{{ ratText(result.root.lower) }} ~ {{ ratText(result.root.upper) }}</span>
+          <span class="badge kind-range">区间结果</span>
+        </template>
+        <template v-else>
+          <span class="value">{{ result.root.value.exact }}</span>
+        </template>
         <span class="unit">{{ result.root.targetSymbol || result.root.target }}</span>
-        <span v-if="formatDecimal(result.root.value)" class="decimal">
+        <span v-if="!isRangeResult && formatDecimal(result.root.value)" class="decimal">
           {{ formatDecimal(result.root.value) }}
         </span>
         <span class="badge" :class="'kind-' + result.root.kind">
@@ -261,7 +289,12 @@ evaluate()
           {{ result.root.dim.t }}, {{ result.root.dim.q }})
         </span>
       </div>
-      <div class="hint">
+      <div v-if="isRangeResult" class="hint">
+        根节点基准值（m, kg, s, K）区间：
+        <code>{{ ratText(result.root.lowerBase) }}</code> ~
+        <code>{{ ratText(result.root.upperBase) }}</code>
+      </div>
+      <div v-else class="hint">
         根节点基准值（m, kg, s, K）：
         <code>{{ result.root.valueBase.exact }}</code>
         <span v-if="result.root.valueBase.decimal !== result.root.valueBase.exact">
@@ -289,10 +322,19 @@ evaluate()
             ({{ s.dim.l }}, {{ s.dim.m }}, {{ s.dim.t }}, {{ s.dim.q }})
           </span>
           <span class="step-val">
-            基准值 = {{ s.valueBase.exact
-            }}<template v-if="s.valueBase.decimal !== s.valueBase.exact">
-              ≈ {{ s.valueBase.decimal }}</template
-            >
+            <template v-if="isRangeResult">
+              基准值区间 = {{ s.lowerBase.exact
+              }}<template v-if="s.lowerBase.decimal !== s.lowerBase.exact">
+                ≈ {{ s.lowerBase.decimal }}</template>
+              ~ {{ s.upperBase.exact
+              }}<template v-if="s.upperBase.decimal !== s.upperBase.exact">
+                ≈ {{ s.upperBase.decimal }}</template>
+            </template>
+            <template v-else>
+              基准值 = {{ s.valueBase.exact
+              }}<template v-if="s.valueBase.decimal !== s.valueBase.exact">
+                ≈ {{ s.valueBase.decimal }}</template>
+            </template>
           </span>
         </div>
         <div class="step-note">{{ s.note }}</div>

@@ -1,0 +1,13 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+
+# test artifacts / playwright reports
+test-results/
+playwright-report/
+
+# local toolchain / scratch binaries
+*.exe
+/tmp/

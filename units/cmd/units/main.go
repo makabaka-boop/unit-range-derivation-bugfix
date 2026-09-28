@@ -83,8 +83,7 @@ func handleEvalRange(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, result)
-}
+	writeJSON(w, http.StatusOK, result)}
 
 func writeErr(w http.ResponseWriter, err error) {
 	var pe parse.Error

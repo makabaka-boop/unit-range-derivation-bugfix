@@ -409,3 +409,289 @@ func TestCrossCheckSamplesPrint(t *testing.T) {
 }
 
 var _ = fmt.Sprintf
+
+// ---- 区间求值的独立第二实现 ----
+//
+// 标量求值器对拍成功后，这里再用同一套独立单位表/种类规则实现一个区间
+// 求值器：标量量退化为 [v,v]，一元负号交换端点，加减法交叉端点，乘除法
+// 枚举四个端点组合取最值，除数区间包含 0 时报错。随机生成含区间字面量的
+// 小树，与生产 eval.EvalRange 逐案比较种类、维度与基准区间端点。
+
+type irng struct {
+	kind int
+	dim  idim
+	lo   *frac
+	hi   *frac
+}
+
+func iFrac(v *big.Rat) *frac {
+	f := &frac{n: new(big.Int).Set(v.Num()), d: new(big.Int).Set(v.Denom())}
+	return f.norm()
+}
+
+func iNumRange(g gnode) (irng, *ierr) {
+	switch x := g.(type) {
+	case gRngNum:
+		lo, _ := new(big.Rat).SetString(x.lo)
+		hi, _ := new(big.Rat).SetString(x.hi)
+		if x.unit == "" {
+			fl, fh := iFrac(lo), iFrac(hi)
+			return irng{kNormal, idim{}, fl, fh}, nil
+		}
+		u := iunits[x.unit]
+		bl, bh := toBase(u, iFrac(lo)), toBase(u, iFrac(hi))
+		if fCmp(bl, bh) > 0 {
+			bl, bh = bh, bl
+		}
+		return irng{u.kind, u.dim, bl, bh}, nil
+	case gLeaf:
+		v, ok := new(big.Rat).SetString(x.num)
+		if !ok {
+			return irng{}, &ierr{"BAD_LITERAL"}
+		}
+		if x.unit == "" {
+			f := iFrac(v)
+			return irng{kNormal, idim{}, f, f}, nil
+		}
+		u := iunits[x.unit]
+		f := iFrac(v)
+		b := toBase(u, f)
+		return irng{u.kind, u.dim, b, b}, nil
+	case gNeg:
+		q, e := iNumRange(x.c)
+		if e != nil {
+			return irng{}, e
+		}
+		return irng{q.kind, q.dim, fNeg(q.hi), fNeg(q.lo)}, nil
+	case gGrp:
+		return iNumRange(x.c)
+	case gBin:
+		a, e := iNumRange(x.l)
+		if e != nil {
+			return irng{}, e
+		}
+		b, e := iNumRange(x.r)
+		if e != nil {
+			return irng{}, e
+		}
+		if x.op == '*' || x.op == '/' {
+			return iRngMulDiv(x.op, a, b)
+		}
+		return iRngAddSub(x.op, a, b)
+	}
+	return irng{}, &ierr{"BAD_TREE"}
+}
+
+func iRngMulDiv(op byte, a, b irng) (irng, *ierr) {
+	if a.kind == kAbsolute || b.kind == kAbsolute {
+		return irng{}, &ierr{eval.ErrAbsMul}
+	}
+	if op == '/' {
+		zeroIn := func(f *frac) bool { return f.n.Sign() == 0 }
+		loNeg := b.lo.n.Sign() < 0
+		hiPos := b.hi.n.Sign() > 0
+		if zeroIn(b.lo) || zeroIn(b.hi) || (loNeg && hiPos) {
+			return irng{}, &ierr{eval.ErrDivZeroRange}
+		}
+	}
+	var d idim
+	cands := make([]*frac, 0, 4)
+	if op == '*' {
+		d = a.dim.add(b.dim)
+		for _, x := range []*frac{a.lo, a.hi} {
+			for _, y := range []*frac{b.lo, b.hi} {
+				cands = append(cands, fMul(x, y))
+			}
+		}
+	} else {
+		d = a.dim.sub(b.dim)
+		for _, x := range []*frac{a.lo, a.hi} {
+			for _, y := range []*frac{b.lo, b.hi} {
+				cands = append(cands, fDiv(x, y))
+			}
+		}
+	}
+	lo, hi := cands[0], cands[0]
+	for _, c := range cands[1:] {
+		if fCmp(c, lo) < 0 {
+			lo = c
+		}
+		if fCmp(c, hi) > 0 {
+			hi = c
+		}
+	}
+	k := kNormal
+	if d.q == 1 && (a.kind == kDelta || b.kind == kDelta) {
+		k = kDelta
+	}
+	return irng{k, d, lo, hi}, nil
+}
+
+// fCmp 比较两个分数：-1/0/1。
+func fCmp(a, b *frac) int {
+	l := new(big.Int).Mul(a.n, b.d)
+	r := new(big.Int).Mul(b.n, a.d)
+	return l.Cmp(r)
+}
+
+func iRngAddSub(op byte, a, b irng) (irng, *ierr) {
+	dimEq := a.dim == b.dim
+	if a.kind == kAbsolute && b.kind == kAbsolute {
+		if op == '-' {
+			return irng{kDelta, a.dim, fSub(a.lo, b.hi), fSub(a.hi, b.lo)}, nil
+		}
+		return irng{}, &ierr{eval.ErrAbsAdd}
+	}
+	if a.kind == kAbsolute || b.kind == kAbsolute {
+		if !dimEq {
+			return irng{}, &ierr{eval.ErrDimMismatch}
+		}
+		if a.kind == kAbsolute {
+			if b.kind != kDelta {
+				return irng{}, &ierr{eval.ErrKindIncompat}
+			}
+			if op == '+' {
+				return irng{kAbsolute, a.dim, fAdd(a.lo, b.lo), fAdd(a.hi, b.hi)}, nil
+			}
+			return irng{kAbsolute, a.dim, fSub(a.lo, b.hi), fSub(a.hi, b.lo)}, nil
+		}
+		if a.kind != kDelta {
+			return irng{}, &ierr{eval.ErrKindIncompat}
+		}
+		if op == '+' {
+			return irng{kAbsolute, a.dim, fAdd(a.lo, b.lo), fAdd(a.hi, b.hi)}, nil
+		}
+		return irng{}, &ierr{eval.ErrDeltaSubAbs}
+	}
+	if !dimEq {
+		return irng{}, &ierr{eval.ErrDimMismatch}
+	}
+	var lo, hi *frac
+	if op == '+' {
+		lo, hi = fAdd(a.lo, b.lo), fAdd(a.hi, b.hi)
+	} else {
+		lo, hi = fSub(a.lo, b.hi), fSub(a.hi, b.lo)
+	}
+	k := kNormal
+	if a.kind == kDelta || b.kind == kDelta {
+		k = kDelta
+	}
+	return irng{k, a.dim, lo, hi}, nil
+}
+
+// gRngLeaf 生成带区间字面量的叶子（区间两端点为不同有理数）。
+func gRngLeaf(rng *rand.Rand) gnode {
+	if rng.Intn(2) == 0 {
+		return genLeaf(rng)
+	}
+	nums := []string{"-4", "-2", "-1", "0", "1", "2", "3", "5", "1/2", "3/2"}
+	lo := nums[rng.Intn(len(nums))]
+	hi := nums[rng.Intn(len(nums))]
+	rlo, _ := new(big.Rat).SetString(lo)
+	rhi, _ := new(big.Rat).SetString(hi)
+	if rlo.Cmp(rhi) > 0 {
+		lo, hi = hi, lo
+	}
+	unit := allUnitNames[rng.Intn(len(allUnitNames))]
+	return gRngNum{lo: lo, hi: hi, unit: unit}
+}
+
+type gRngNum struct {
+	lo, hi, unit string
+}
+
+func (gRngNum) gnode() {}
+
+func renderRng(g gnode) string {
+	switch x := g.(type) {
+	case gRngNum:
+		num := "[" + x.lo + "," + x.hi + "]"
+		if x.unit == "" {
+			return num
+		}
+		return num + " " + x.unit
+	case gLeaf:
+		if x.unit == "" {
+			return x.num
+		}
+		return x.num + " " + x.unit
+	case gNeg:
+		return "(-" + renderRng(x.c) + ")"
+	case gGrp:
+		return "(" + renderRng(x.c) + ")"
+	case gBin:
+		return "(" + renderRng(x.l) + " " + string(x.op) + " " + renderRng(x.r) + ")"
+	}
+	return ""
+}
+
+func genRngTree(rng *rand.Rand, depth int) gnode {
+	if depth <= 0 || rng.Intn(100) < 35 {
+		return gRngLeaf(rng)
+	}
+	switch rng.Intn(10) {
+	case 0, 1:
+		return gNeg{c: genRngTree(rng, depth-1)}
+	case 2:
+		return gGrp{c: genRngTree(rng, depth-1)}
+	default:
+		ops := []byte{'+', '-', '*', '/'}
+		return gBin{op: ops[rng.Intn(4)], l: genRngTree(rng, depth-1), r: genRngTree(rng, depth-1)}
+	}
+}
+
+func TestCrossCheckRangeRandomTrees(t *testing.T) {
+	rng := rand.New(rand.NewSource(20260928))
+	const n = 4000
+	for i := 0; i < n; i++ {
+		g := genRngTree(rng, 2+rng.Intn(2))
+		src := renderRng(g)
+
+		ast, perr := parse.Parse(src)
+		if perr != nil {
+			t.Fatalf("case %d: generated source not parseable: %q -> %v", i, src, perr)
+		}
+		iq, ierrv := iNumRange(g)
+		res, eerr := eval.EvalRange(ast, "")
+
+		if ierrv != nil {
+			if eerr == nil {
+				t.Fatalf("case %d: %q\nindependent rejected (%s) but production accepted",
+					i, src, ierrv.code)
+			}
+			ee := eerr.(eval.Error)
+			if ee.Code != ierrv.code {
+				t.Fatalf("case %d: %q\nerror mismatch: independent=%s production=%s",
+					i, src, ierrv.code, ee.Code)
+			}
+			continue
+		}
+		if eerr != nil {
+			t.Fatalf("case %d: %q\nproduction rejected (%v) but independent accepted kind=%s dim=%+v",
+				i, src, eerr, kindName(iq.kind), iq.dim)
+		}
+		if res.Root.Kind != kindName(iq.kind) {
+			t.Fatalf("case %d: %q\nkind mismatch: independent=%s production=%s",
+				i, src, kindName(iq.kind), res.Root.Kind)
+		}
+		wantDim := [4]int{iq.dim.l, iq.dim.m, iq.dim.t, iq.dim.q}
+		if wantDim != res.Root.Dim.Vector() {
+			t.Fatalf("case %d: %q\ndim mismatch: independent=%v production=%v",
+				i, src, wantDim, res.Root.Dim.Vector())
+		}
+		gotLo := exactRat(t, res.Root.LowerBase)
+		wantLo := &big.Rat{}
+		wantLo.SetFrac(iq.lo.n, iq.lo.d)
+		if gotLo.Cmp(wantLo) != 0 {
+			t.Fatalf("case %d: %q\nlower mismatch: independent=%s production=%s",
+				i, src, iq.lo, gotLo)
+		}
+		gotHi := exactRat(t, res.Root.UpperBase)
+		wantHi := &big.Rat{}
+		wantHi.SetFrac(iq.hi.n, iq.hi.d)
+		if gotHi.Cmp(wantHi) != 0 {
+			t.Fatalf("case %d: %q\nupper mismatch: independent=%s production=%s",
+				i, src, iq.hi, gotHi)
+		}
+	}
+}
