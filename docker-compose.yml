@@ -1,0 +1,31 @@
+services:
+  # Go HTTP 服务：解析与计算
+  units:
+    build:
+      context: ./units
+    container_name: units
+    environment:
+      ADDR: ":8080"
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # Vue 页面：编辑表达式并展示逐步推导
+  desk:
+    build:
+      context: ./desk
+    container_name: desk
+    environment:
+      # 浏览器侧同源访问 /api，由 desk 容器内的代理转发到 units
+      UNITS_URL: "http://units:8080"
+    ports:
+      - "5173:5173"
+    depends_on:
+      units:
+        condition: service_healthy
+    restart: unless-stopped
