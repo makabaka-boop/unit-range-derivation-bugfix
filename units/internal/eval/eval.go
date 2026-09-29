@@ -35,6 +35,7 @@ const (
 	ErrKindIncompat  = "KIND_INCOMPATIBLE"
 	ErrDimMismatch   = "DIMENSION_MISMATCH"
 	ErrDivZero       = "DIVISION_BY_ZERO"
+	ErrDivSpanZero   = "DIVISOR_INTERVAL_SPANS_ZERO"
 	ErrTargetKind    = "TARGET_KIND_INCOMPATIBLE"
 	ErrTargetDim     = "TARGET_DIMENSION_MISMATCH"
 	ErrUnknownTarget = "UNKNOWN_TARGET_UNIT"
@@ -277,11 +278,7 @@ func (ev *evaluator) evalMulDiv(n *parse.BinaryNode, a, b Q) (Q, error) {
 		d = a.Dim.Sub(b.Dim)
 		v = new(big.Rat).Quo(a.Value, b.Value)
 	}
-	k := phys.Normal
-	// 仅当结果温度维度恰好为 1 且来源含温差时，结果仍是温差。
-	if d.Q == 1 && (a.Kind == phys.Delta || b.Kind == phys.Delta) {
-		k = phys.Delta
-	}
+	k := resultKindMulDiv(a.Kind, b.Kind, d)
 	q := mkQ(k, d, v)
 	op := string(n.Op)
 	ev.emit(n, "binary", op, q, fmt.Sprintf(
@@ -291,82 +288,99 @@ func (ev *evaluator) evalMulDiv(n *parse.BinaryNode, a, b Q) (Q, error) {
 	return q, nil
 }
 
+// resultKindMulDiv 是乘除的种类规则，标量与区间求值共用：
+// 仅当结果温度维度恰好为 1 且来源含温差时，结果仍是温差。
+func resultKindMulDiv(ka, kb phys.Kind, d phys.Dim) phys.Kind {
+	if d.Q == 1 && (ka == phys.Delta || kb == phys.Delta) {
+		return phys.Delta
+	}
+	return phys.Normal
+}
+
 func (ev *evaluator) evalAddSub(n *parse.BinaryNode, a, b Q) (Q, error) {
-	op := string(n.Op)
-	dimEq := a.Dim.Equal(b.Dim)
-
-	// 绝对 ± 绝对
-	if a.Kind == phys.Absolute && b.Kind == phys.Absolute {
-		if n.Op == '-' {
-			q := mkQ(phys.Delta, a.Dim, new(big.Rat).Sub(a.Value, b.Value))
-			ev.emit(n, "binary", op, q,
-				"绝对温度 - 绝对温度 = 温差（K 基准值相减，结果为温差）")
-			return q, nil
-		}
-		return Q{}, evalErrf(n, ErrAbsAdd,
-			"两个绝对温度不能相加：绝对温度的零点不是数量零点，相加没有物理意义")
-	}
-
-	// 至少一侧是绝对温度
-	if a.Kind == phys.Absolute || b.Kind == phys.Absolute {
-		if !dimEq {
-			return Q{}, evalErrf(n, ErrDimMismatch,
-				"维度不相容：%s（%s）与 %s（%s）不能相%s",
-				a.Dim.String(), a.Kind.String(), b.Dim.String(), b.Kind.String(), opName(n.Op))
-		}
-		if a.Kind == phys.Absolute {
-			// 绝对 ± 温差 => 绝对；绝对 ± 普通量 => 种类不相容
-			if b.Kind != phys.Delta {
-				return Q{}, evalErrf(n, ErrKindIncompat,
-					"绝对温度只能与温差相加减，不能与普通量相%s", opName(n.Op))
-			}
-			v := new(big.Rat)
-			if n.Op == '+' {
-				v.Add(a.Value, b.Value)
-			} else {
-				v.Sub(a.Value, b.Value)
-			}
-			q := mkQ(phys.Absolute, a.Dim, v)
-			ev.emit(n, "binary", op, q,
-				"绝对温度 ± 温差 = 绝对温度（在 K 基准值上平移）")
-			return q, nil
-		}
-		// 右侧是绝对：温差 + 绝对 => 绝对；温差 - 绝对非法
-		if a.Kind != phys.Delta {
-			return Q{}, evalErrf(n, ErrKindIncompat,
-				"普通量不能与绝对温度相%s", opName(n.Op))
-		}
-		if n.Op == '+' {
-			q := mkQ(phys.Absolute, a.Dim, new(big.Rat).Add(a.Value, b.Value))
-			ev.emit(n, "binary", op, q, "温差 + 绝对温度 = 绝对温度")
-			return q, nil
-		}
-		return Q{}, evalErrf(n, ErrDeltaSubAbs,
-			"温差减去绝对温度没有意义：只有 绝对-绝对、绝对±温差、温差+绝对 合法")
-	}
-
-	// 两侧均非绝对：维度必须相同；温差与同维度量相容，结果含温差即为温差。
-	if !dimEq {
-		return Q{}, evalErrf(n, ErrDimMismatch,
-			"维度不相容：%s 与 %s 不能相%s", a.Dim.String(), b.Dim.String(), opName(n.Op))
+	op := n.Op
+	k, d, code, msg := checkAddSub(op, a.Kind, b.Kind, a.Dim, b.Dim)
+	if code != "" {
+		return Q{}, evalErrf(n, code, msg)
 	}
 	var v *big.Rat
-	if n.Op == '+' {
+	if op == '+' {
 		v = new(big.Rat).Add(a.Value, b.Value)
 	} else {
 		v = new(big.Rat).Sub(a.Value, b.Value)
 	}
+	q := mkQ(k, d, v)
+	ev.emit(n, "binary", string(op), q, addSubNote(op, a.Kind, b.Kind, k))
+	return q, nil
+}
+
+// checkAddSub 是加减的种类/维度规则，标量与区间求值共用。
+// 返回 (结果种类, 结果维度, 错误码, 错误信息)；code 为空表示合法。
+// 合法时的运算规则：
+//
+//	绝对 - 绝对 => 温差
+//	绝对 ± 温差、温差 + 绝对 => 绝对
+//	其余 => 维度相同才可加减，结果含温差即为温差
+func checkAddSub(op byte, ka, kb phys.Kind, da, db phys.Dim) (phys.Kind, phys.Dim, string, string) {
+	dimEq := da.Equal(db)
+	if ka == phys.Absolute && kb == phys.Absolute {
+		if op == '-' {
+			return phys.Delta, da, "", ""
+		}
+		return 0, phys.Dim{}, ErrAbsAdd,
+			"两个绝对温度不能相加：绝对温度的零点不是数量零点，相加没有物理意义"
+	}
+	if ka == phys.Absolute || kb == phys.Absolute {
+		if !dimEq {
+			return 0, phys.Dim{}, ErrDimMismatch,
+				fmt.Sprintf("维度不相容：%s（%s）与 %s（%s）不能相%s",
+					da.String(), ka.String(), db.String(), kb.String(), opName(op))
+		}
+		if ka == phys.Absolute {
+			// 绝对 ± 温差 => 绝对；绝对 ± 普通量 => 种类不相容
+			if kb != phys.Delta {
+				return 0, phys.Dim{}, ErrKindIncompat,
+					fmt.Sprintf("绝对温度只能与温差相加减，不能与普通量相%s", opName(op))
+			}
+			return phys.Absolute, da, "", ""
+		}
+		// 右侧是绝对：温差 + 绝对 => 绝对；温差 - 绝对非法
+		if ka != phys.Delta {
+			return 0, phys.Dim{}, ErrKindIncompat,
+				fmt.Sprintf("普通量不能与绝对温度相%s", opName(op))
+		}
+		if op == '+' {
+			return phys.Absolute, da, "", ""
+		}
+		return 0, phys.Dim{}, ErrDeltaSubAbs,
+			"温差减去绝对温度没有意义：只有 绝对-绝对、绝对±温差、温差+绝对 合法"
+	}
+	if !dimEq {
+		return 0, phys.Dim{}, ErrDimMismatch,
+			fmt.Sprintf("维度不相容：%s 与 %s 不能相%s", da.String(), db.String(), opName(op))
+	}
 	k := phys.Normal
-	if a.Kind == phys.Delta || b.Kind == phys.Delta {
+	if ka == phys.Delta || kb == phys.Delta {
 		k = phys.Delta
 	}
-	q := mkQ(k, dCopy(a.Dim), v)
-	note := "同维度普通量相加减（基准单位相同，直接做有理数运算）"
-	if k == phys.Delta {
-		note = "温差与温差（或同维量）相加减，结果仍为温差；华氏温差已按 5/9 折算为 K"
+	return k, dCopy(da), "", ""
+}
+
+// addSubNote 给出加减节点的推导说明，标量与区间共用同一套措辞。
+func addSubNote(op byte, ka, kb, kr phys.Kind) string {
+	if ka == phys.Absolute && kb == phys.Absolute {
+		return "绝对温度 - 绝对温度 = 温差（K 基准值相减，结果为温差）"
 	}
-	ev.emit(n, "binary", op, q, note)
-	return q, nil
+	if kr == phys.Absolute {
+		if ka == phys.Absolute {
+			return "绝对温度 ± 温差 = 绝对温度（在 K 基准值上平移）"
+		}
+		return "温差 + 绝对温度 = 绝对温度"
+	}
+	if kr == phys.Delta {
+		return "温差与温差（或同维量）相加减，结果仍为温差；华氏温差已按 5/9 折算为 K"
+	}
+	return "同维度普通量相加减（基准单位相同，直接做有理数运算）"
 }
 
 func dCopy(d phys.Dim) phys.Dim { return d }
@@ -385,40 +399,55 @@ func convertTarget(n parse.Node, q Q, target string) (RootView, error) {
 		Kind: q.Kind.JSON(), Dim: q.Dim, DimName: q.Dim.String(),
 		ValueBase: view(q.Value),
 	}
-	if target == "" || target == "auto" {
-		name, sym, val := autoTarget(q)
-		rv.Target, rv.TargetSym, rv.Value = name, sym, view(val)
-		return rv, nil
+	name, sym, u, err := resolveTarget(n, q, target)
+	if err != nil {
+		return rv, err
 	}
-	u, ok := phys.ByName(target)
-	if !ok {
-		return rv, Error{Code: ErrUnknownTarget,
-			Message: fmt.Sprintf("未知目标单位 %q", target), Pos: n.Pos(), End: n.End()}
-	}
-	if !u.Dim.Equal(q.Dim) {
-		return rv, evalErrf(n, ErrTargetDim,
-			"目标单位 %s 的维度是 %s，与结果维度 %s 不一致", u.Sym, u.Dim.String(), q.Dim.String())
-	}
-	if u.Kind != q.Kind {
-		return rv, evalErrf(n, ErrTargetKind,
-			"目标单位 %s 属于%s，而结果是%s，不能这样表示", u.Sym, u.Kind.String(), q.Kind.String())
-	}
-	rv.Target, rv.TargetSym = u.Name, u.Sym
+	rv.Target, rv.TargetSym = name, sym
 	rv.Value = view(u.FromBase(q.Value))
 	return rv, nil
 }
 
-// autoTarget 为结果选择默认目标单位并完成换算。
-func autoTarget(q Q) (name, sym string, val *big.Rat) {
+// resolveTarget 按 target 名解析目标单位并校验维度/种类；
+// target 为空或 "auto" 时自动选择。返回的单位 u 可用于 FromBase。
+// 标量与区间求值共用，保证两者目标单位规则完全一致。
+func resolveTarget(n parse.Node, q Q, target string) (name, sym string, u *phys.Unit, err error) {
+	if target == "" || target == "auto" {
+		return autoTargetUnit(q)
+	}
+	u, ok := phys.ByName(target)
+	if !ok {
+		return "", "", nil, Error{Code: ErrUnknownTarget,
+			Message: fmt.Sprintf("未知目标单位 %q", target), Pos: n.Pos(), End: n.End()}
+	}
+	if !u.Dim.Equal(q.Dim) {
+		return "", "", nil, evalErrf(n, ErrTargetDim,
+			"目标单位 %s 的维度是 %s，与结果维度 %s 不一致", u.Sym, u.Dim.String(), q.Dim.String())
+	}
+	if u.Kind != q.Kind {
+		return "", "", nil, evalErrf(n, ErrTargetKind,
+			"目标单位 %s 属于%s，而结果是%s，不能这样表示", u.Sym, u.Kind.String(), q.Kind.String())
+	}
+	return u.Name, u.Sym, u, nil
+}
+
+// autoTargetUnit 为结果选择默认目标单位（不改变数值的基准单位视图）。
+func autoTargetUnit(q Q) (name, sym string, u *phys.Unit, err error) {
 	switch q.Kind {
 	case phys.Absolute:
-		u, _ := phys.ByName("K")
-		return "K", "K", u.FromBase(q.Value)
+		u, _ = phys.ByName("K")
 	case phys.Delta:
-		u, _ := phys.ByName("dK")
-		return "dK", "dK", u.FromBase(q.Value)
+		u, _ = phys.ByName("dK")
+	default:
+		return "base", derivedSymbol(q.Dim), identityUnit(q.Dim), nil
 	}
-	return "base", derivedSymbol(q.Dim), new(big.Rat).Set(q.Value)
+	return u.Name, u.Sym, u, nil
+}
+
+// identityUnit 是自动目标下的“基准导出单位”：FromBase/ToBase 恒等。
+func identityUnit(d phys.Dim) *phys.Unit {
+	return &phys.Unit{Name: "base", Sym: derivedSymbol(d), Dim: d,
+		Kind: phys.Normal, Conv: phys.Linear, Factor: big.NewRat(1, 1)}
 }
 
 func derivedSymbol(d phys.Dim) string {

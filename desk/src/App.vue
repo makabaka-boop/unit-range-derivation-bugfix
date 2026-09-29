@@ -71,6 +71,9 @@ const unitGroups = [
 
 const kindText = { normal: '普通量', delta: '温差', absolute: '绝对温度' }
 
+// 区间模式的结果带 lower/upper；标量模式只有 value。
+const isRangeResult = (r) => !!(r && r.root && r.root.lower && r.root.upper)
+
 const runes = computed(() => Array.from(expression.value))
 
 // 高亮出错的最小区间
@@ -155,9 +158,33 @@ function useExample(ex) {
 }
 
 function formatDecimal(v) {
-  if (v.decimal && v.decimal !== v.exact) return `≈ ${v.decimal}`
+  if (v && v.decimal && v.decimal !== v.exact) return `≈ ${v.decimal}`
   return ''
 }
+
+// 根节点一行摘要：标量给单个值，区间给 [下界, 上界]。
+const rootDisplay = computed(() => {
+  const r = result.value
+  if (!r) return null
+  if (isRangeResult(r)) {
+    return {
+      lower: r.root.lower.exact,
+      upper: r.root.upper.exact,
+      // 任一端点的小数近似与分数不同，就整体展示一次近似区间。
+      showDecimal:
+        formatDecimal(r.root.lower) !== '' || formatDecimal(r.root.upper) !== '',
+      lowerDecimal: r.root.lower.decimal,
+      upperDecimal: r.root.upper.decimal
+    }
+  }
+  return {
+    lower: r.root.value.exact,
+    upper: r.root.value.exact,
+    showDecimal: formatDecimal(r.root.value) !== '',
+    lowerDecimal: r.root.value.decimal,
+    upperDecimal: r.root.value.decimal
+  }
+})
 
 function nodeLabel(s) {
   switch (s.nodeType) {
@@ -247,11 +274,22 @@ evaluate()
     <!-- 成功结果：errorInfo 非空或尚未计算时整体不渲染，杜绝旧结果残留 -->
     <section v-if="result && !errorInfo" class="panel" data-testid="result">
       <div class="result-card">
-        <span class="value">{{ result.root.value.exact }}</span>
+        <template v-if="isRangeResult(result)">
+          <span class="value" data-testid="range-value">
+            [<span data-testid="range-lower">{{ rootDisplay.lower }}</span>,
+            <span data-testid="range-upper">{{ rootDisplay.upper }}</span>]
+          </span>
+          <span v-if="rootDisplay.showDecimal" class="decimal" data-testid="range-decimal">
+            （≈ [{{ rootDisplay.lowerDecimal }}, {{ rootDisplay.upperDecimal }}]）
+          </span>
+        </template>
+        <template v-else>
+          <span class="value" data-testid="scalar-value">{{ result.root.value.exact }}</span>
+          <span v-if="formatDecimal(result.root.value)" class="decimal">
+            {{ formatDecimal(result.root.value) }}
+          </span>
+        </template>
         <span class="unit">{{ result.root.targetSymbol || result.root.target }}</span>
-        <span v-if="formatDecimal(result.root.value)" class="decimal">
-          {{ formatDecimal(result.root.value) }}
-        </span>
         <span class="badge" :class="'kind-' + result.root.kind">
           {{ kindText[result.root.kind] }}
         </span>
@@ -262,16 +300,25 @@ evaluate()
         </span>
       </div>
       <div class="hint">
-        根节点基准值（m, kg, s, K）：
-        <code>{{ result.root.valueBase.exact }}</code>
-        <span v-if="result.root.valueBase.decimal !== result.root.valueBase.exact">
-          （≈ {{ result.root.valueBase.decimal }}）
-        </span>
+        <template v-if="isRangeResult(result)">
+          根节点基准值区间（m, kg, s, K）：
+          <code data-testid="range-base">[{{ result.root.lowerBase.exact }},
+            {{ result.root.upperBase.exact }}]</code>
+        </template>
+        <template v-else>
+          根节点基准值（m, kg, s, K）：
+          <code>{{ result.root.valueBase.exact }}</code>
+          <span v-if="result.root.valueBase.decimal !== result.root.valueBase.exact">
+            （≈ {{ result.root.valueBase.decimal }}）
+          </span>
+        </template>
       </div>
     </section>
 
     <section v-if="result && !errorInfo" class="panel steps" data-testid="steps">
-      <h2>逐步推导（后序：每个叶子与运算节点）</h2>
+      <h2>
+        逐步推导（后序：每个叶子与运算节点{{ isRangeResult(result) ? '，各给出基准值区间的上下界' : '' }}）
+      </h2>
       <div
         v-for="(s, i) in result.steps"
         :key="i"
@@ -288,7 +335,17 @@ evaluate()
           <span class="badge">
             ({{ s.dim.l }}, {{ s.dim.m }}, {{ s.dim.t }}, {{ s.dim.q }})
           </span>
-          <span class="step-val">
+          <span v-if="isRangeResult(result)" class="step-val" data-testid="step-range-val">
+            基准值区间 = [{{ s.lowerBase.exact }},
+            {{ s.upperBase.exact
+            }}]<template
+              v-if="s.lowerBase.decimal !== s.lowerBase.exact ||
+                s.upperBase.decimal !== s.upperBase.exact"
+            >
+              （≈ [{{ s.lowerBase.decimal }}, {{ s.upperBase.decimal }}]）</template
+            >
+          </span>
+          <span v-else class="step-val">
             基准值 = {{ s.valueBase.exact
             }}<template v-if="s.valueBase.decimal !== s.valueBase.exact">
               ≈ {{ s.valueBase.decimal }}</template
